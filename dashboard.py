@@ -5,6 +5,7 @@ import re
 import os
 import sqlite3
 from collections import defaultdict
+from datetime import datetime, timezone
 from flask import Flask, jsonify, render_template_string
 from waitress import serve
 
@@ -73,8 +74,144 @@ def _tail_lines(path: str, n: int) -> list[str]:
     return buf.decode("utf-8", errors="replace").splitlines()[-n:]
 
 
+def _fetch_trade_periods() -> list[tuple]:
+    """Returns (open_dt, close_dt_or_None, pair, trade_id) for every trade."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT id, pair, open_date, close_date FROM trades ORDER BY open_date")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    periods = []
+    for r in rows:
+        def _dt(s):
+            return datetime.strptime(s.split(".")[0], "%Y-%m-%d %H:%M:%S") if s else None
+        periods.append((_dt(r["open_date"]), _dt(r["close_date"]), r["pair"], r["id"]))
+    return periods
+
+
+def _assess_impact(event: dict, trade_periods: list) -> dict:
+    """Classify whether an error actually affected a trading decision."""
+    msg      = event["message"]
+    msg_low  = msg.lower()
+    cat      = event["cat_slug"]
+
+    try:
+        ts = datetime.strptime(event["ts"], "%Y-%m-%d %H:%M:%S,%f")
+    except ValueError:
+        return {"level": "none", "label": "No Impact", "reason": ""}
+
+    def _active_trade(ts):
+        now = datetime.utcnow()
+        for open_dt, close_dt, pair, tid in trade_periods:
+            if open_dt <= ts <= (close_dt or now):
+                return pair, tid
+        return None, None
+
+    # ── Definitive blocks: bot explicitly logged it could not act ─────────────
+    if "unable to exit trade" in msg_low:
+        pair_m = re.search(r"trade (\S+?):", msg)
+        pair = pair_m.group(1) if pair_m else "unknown"
+        return {
+            "level": "blocked",
+            "label": "Exit Blocked",
+            "reason": (
+                f"Bot tried to exit {pair} but Binance API was unreachable after all retries. "
+                f"The exit was skipped for that candle cycle — position held longer than intended."
+            ),
+        }
+
+    if "unable to adjust" in msg_low:
+        pair_m = re.search(r"trade for (\S+?):", msg)
+        pair = pair_m.group(1) if pair_m else "unknown"
+        return {
+            "level": "blocked",
+            "label": "DCA Blocked",
+            "reason": (
+                f"Bot could not adjust (DCA / grind) the position for {pair}. "
+                f"The cost-averaging buy was skipped — average entry price was not improved."
+            ),
+        }
+
+    if "cancelling entry" in msg_low and "slippage" in msg_low:
+        pair_m = re.search(r"for (\S+) due", msg)
+        pct_m  = re.search(r"slippage ([\d.]+)%", msg_low)
+        pair = pair_m.group(1) if pair_m else "unknown"
+        pct  = pct_m.group(1) if pct_m else "?"
+        return {
+            "level": "blocked",
+            "label": "Entry Blocked",
+            "reason": (
+                f"Entry for {pair} was cancelled because price moved {pct}% beyond the allowed slippage "
+                f"threshold before the order could fill. Bot retried on the next cycle."
+            ),
+        }
+
+    if "giving up" in msg_low:
+        pair, tid = _active_trade(ts)
+        if pair:
+            return {
+                "level": "blocked",
+                "label": "API Call Abandoned",
+                "reason": (
+                    f"Bot exhausted all retries during open trade #{tid} ({pair}). "
+                    f"That evaluation cycle was skipped entirely — signals for this candle were not processed."
+                ),
+            }
+        return {"level": "none", "label": "No Impact", "reason": "No trades were active when retries were exhausted."}
+
+    # ── Telegram — notification only, zero trading relevance ─────────────────
+    if cat == "tg":
+        return {
+            "level": "none",
+            "label": "No Impact",
+            "reason": "Telegram handles notifications only. Trading logic ran independently and was unaffected.",
+        }
+
+    # ── WebSocket — freqtrade auto-reconnects via REST fallback ───────────────
+    if cat == "ws":
+        return {
+            "level": "recovered",
+            "label": "Auto-recovered",
+            "reason": (
+                "WebSocket disconnected from Binance but freqtrade automatically switches to "
+                "REST API polling. No candle cycle was missed; latency increased slightly until reconnect."
+            ),
+        }
+
+    # ── REST fallback — WebSocket dropped but bot switched to polling automatically
+    if "falling back to rest" in msg_low:
+        return {
+            "level": "recovered",
+            "label": "Auto-recovered",
+            "reason": (
+                "WebSocket stream was stale; freqtrade automatically fell back to REST API polling "
+                "for that candle. No evaluation cycle was skipped."
+            ),
+        }
+
+    # ── Exchange / API errors — impact depends on whether a trade was open ────
+    pair, tid = _active_trade(ts)
+    if pair:
+        return {
+            "level": "delayed",
+            "label": "Signal Delayed",
+            "reason": (
+                f"Candle or ticker data was temporarily unavailable during open trade #{tid} ({pair}). "
+                f"Strategy evaluation for that 5-minute candle may have been delayed by one cycle."
+            ),
+        }
+
+    return {
+        "level": "none",
+        "label": "No Impact",
+        "reason": "No trades were active at this time — the error occurred during an idle period.",
+    }
+
+
 def parse_errors(limit: int = MAX_ERRORS) -> dict:
-    lines = _tail_lines(LOG_PATH, LOG_TAIL_LINES)
+    lines        = _tail_lines(LOG_PATH, LOG_TAIL_LINES)
+    trade_periods = _fetch_trade_periods()
     events = []
     current = None
 
@@ -103,27 +240,31 @@ def parse_errors(limit: int = MAX_ERRORS) -> dict:
     events = events[-limit:]
     events.reverse()
 
-    counts   = defaultdict(int)
-    by_cat   = defaultdict(int)
+    counts     = defaultdict(int)
+    by_cat     = defaultdict(int)
+    by_impact  = defaultdict(int)
     sig_counts: dict[str, int] = defaultdict(int)
 
     for e in events:
         counts[e["level"]] += 1
         by_cat[e["category"]] += 1
-        sig = re.sub(r'[A-Z]+/USDT', 'PAIR', e["message"])
-        sig = re.sub(r'\b\d+[mhd]\b', 'TF', sig)[:120]
+        sig = re.sub(r"[A-Z]+/USDT", "PAIR", e["message"])
+        sig = re.sub(r"\b\d+[mhd]\b", "TF", sig)[:120]
         e["sig"] = sig
         sig_counts[sig] += 1
+        e["impact"] = _assess_impact(e, trade_periods)
+        by_impact[e["impact"]["level"]] += 1
 
     for e in events:
         e["count"] = sig_counts[e["sig"]]
 
     return {
-        "total": len(events),
-        "errors": counts.get("ERROR", 0),
-        "warnings": counts.get("WARNING", 0),
-        "criticals": counts.get("CRITICAL", 0),
+        "total":      len(events),
+        "errors":     counts.get("ERROR", 0),
+        "warnings":   counts.get("WARNING", 0),
+        "criticals":  counts.get("CRITICAL", 0),
         "by_category": dict(by_cat),
+        "by_impact":   dict(by_impact),
         "events": [
             {
                 "ts": e["ts"], "level": e["level"],
@@ -131,6 +272,7 @@ def parse_errors(limit: int = MAX_ERRORS) -> dict:
                 "cat_slug": e["cat_slug"], "message": e["message"],
                 "detail": "\n".join(e["detail"][-6:]),
                 "count": e["count"],
+                "impact": e["impact"],
             }
             for e in events
         ],
@@ -263,17 +405,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .filter-btn.f-error.active{color:var(--red);border-color:var(--red);background:rgba(248,81,73,.1)}
   .filter-btn.f-warning.active{color:var(--yellow);border-color:var(--yellow);background:rgba(210,153,34,.1)}
   .filter-btn.f-ws.active,.filter-btn.f-api.active,.filter-btn.f-tg.active,.filter-btn.f-strat.active{color:var(--blue);border-color:var(--blue);background:rgba(56,139,253,.1)}
+  .filter-btn.f-affected.active{color:var(--orange);border-color:var(--orange);background:rgba(227,148,62,.12);font-weight:600}
 
   .err-list{padding:0}
   .err-row{border-bottom:1px solid rgba(48,54,61,.4);padding:12px 20px;cursor:pointer;transition:background .1s}
   .err-row:last-child{border-bottom:none}
   .err-row:hover{background:rgba(255,255,255,.025)}
+  .err-row.impact-blocked{border-left:3px solid var(--red)}
+  .err-row.impact-delayed{border-left:3px solid var(--orange)}
   .err-row-top{display:flex;align-items:flex-start;gap:10px}
   .err-badge{font-size:10px;font-weight:700;padding:2px 7px;border-radius:6px;white-space:nowrap;flex-shrink:0;margin-top:1px}
   .badge-ERROR{background:rgba(248,81,73,.18);color:var(--red)}
   .badge-WARNING{background:rgba(210,153,34,.18);color:var(--yellow)}
   .badge-CRITICAL{background:rgba(163,113,247,.18);color:var(--purple)}
   .cat-pill{font-size:10px;padding:2px 7px;border-radius:6px;background:rgba(56,139,253,.12);color:var(--blue);flex-shrink:0;margin-top:1px}
+  .impact-pill{font-size:10px;font-weight:700;padding:2px 8px;border-radius:6px;white-space:nowrap;flex-shrink:0;margin-top:1px}
+  .impact-blocked{background:rgba(248,81,73,.18);color:var(--red)}
+  .impact-delayed{background:rgba(227,148,62,.18);color:var(--orange)}
+  .impact-recovered{background:rgba(56,139,253,.12);color:var(--blue)}
+  .impact-none{background:rgba(139,148,158,.1);color:var(--muted)}
+  .impact-reason{font-size:11px;color:var(--muted);margin-top:5px;line-height:1.5;padding:6px 10px;background:rgba(0,0,0,.2);border-radius:5px;border-left:2px solid var(--border)}
+  .impact-reason.r-blocked{border-left-color:var(--red)}
+  .impact-reason.r-delayed{border-left-color:var(--orange)}
+  .impact-reason.r-recovered{border-left-color:var(--blue)}
   .err-msg{font-size:12.5px;color:var(--text);flex:1;word-break:break-word;line-height:1.5}
   .err-meta{display:flex;gap:12px;margin-top:4px;font-size:11px;color:var(--muted)}
   .err-count{font-size:10px;background:rgba(139,148,158,.15);color:var(--muted);padding:1px 7px;border-radius:10px;white-space:nowrap;flex-shrink:0;align-self:flex-start;margin-top:2px}
@@ -287,6 +441,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .pill-error{background:rgba(248,81,73,.15);color:var(--red)}
   .pill-warn{background:rgba(210,153,34,.15);color:var(--yellow)}
   .pill-crit{background:rgba(163,113,247,.15);color:var(--purple)}
+  .pill-blocked{background:rgba(248,81,73,.2);color:var(--red);border:1px solid rgba(248,81,73,.4)}
+  .pill-delayed{background:rgba(227,148,62,.15);color:var(--orange)}
 
   .refresh-btn{background:var(--accent);color:#fff;border:none;border-radius:8px;padding:7px 16px;cursor:pointer;font-size:13px}
   .refresh-btn:hover{background:#1a73e8}
@@ -341,6 +497,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
       <div class="err-filters">
         <button class="filter-btn f-all active" onclick="setFilter('all',this)">All</button>
+        <button class="filter-btn f-affected" onclick="setFilter('affected',this)">⚠ Affected Trading</button>
         <button class="filter-btn f-error" onclick="setFilter('ERROR',this)">Errors</button>
         <button class="filter-btn f-warning" onclick="setFilter('WARNING',this)">Warnings</button>
         <button class="filter-btn f-ws" onclick="setFilter('ws',this)">WebSocket</button>
@@ -445,6 +602,13 @@ function renderTrades(data) {
   document.getElementById('last-update').textContent='Updated '+new Date().toLocaleTimeString();
 }
 
+const IMPACT_META = {
+  blocked:   { label: 'Blocked',       cls: 'impact-blocked',   icon: '⛔' },
+  delayed:   { label: 'Signal Delayed',cls: 'impact-delayed',   icon: '⚠' },
+  recovered: { label: 'Auto-recovered',cls: 'impact-recovered', icon: '↺' },
+  none:      { label: 'No Impact',     cls: 'impact-none',      icon: '—' },
+};
+
 function setFilter(f,btn){
   activeFilter=f;
   document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
@@ -456,21 +620,32 @@ function renderErrorList(){
   const list=document.getElementById('err-list');
   const filtered=allErrors.filter(e=>{
     if(activeFilter==='all') return true;
+    if(activeFilter==='affected') return e.impact.level==='blocked'||e.impact.level==='delayed';
     if(activeFilter==='ERROR'||activeFilter==='WARNING') return e.level===activeFilter;
     return e.cat_slug===activeFilter;
   });
   if(!filtered.length){list.innerHTML='<p class="no-data">No events match this filter.</p>';return;}
   list.innerHTML=filtered.map((e,i)=>{
+    const imp=e.impact, meta=IMPACT_META[imp.level]||IMPACT_META.none;
     const hasDetail=e.detail&&e.detail.trim().length>0;
-    const chevron=hasDetail?'<span class="err-chevron">▶</span>':'';
+    const clickable=hasDetail||imp.reason;
+    const chevron=clickable?'<span class="err-chevron">▶</span>':'';
     const detail=hasDetail?`<div class="err-detail">${esc(e.detail)}</div>`:'';
+    const reason=imp.reason?`<div class="impact-reason r-${imp.level}">${esc(imp.reason)}</div>`:'';
     const countBadge=e.count>1?`<span class="err-count">×${e.count}</span>`:'';
-    return `<div class="err-row" id="er${i}" ${hasDetail?`onclick="toggleRow('er${i}')"`:''}><div class="err-row-top">
-      ${chevron}<span class="err-badge badge-${e.level}">${e.level}</span>
+    const rowCls=`err-row${imp.level==='blocked'||imp.level==='delayed'?' impact-'+imp.level:''}`;
+    return `<div class="${rowCls}" id="er${i}" ${clickable?`onclick="toggleRow('er${i}')"`:''}><div class="err-row-top">
+      ${chevron}
+      <span class="err-badge badge-${e.level}">${e.level}</span>
       <span class="cat-pill">${esc(e.category)}</span>
-      <div style="flex:1"><div class="err-msg">${esc(e.message)}</div>
-      <div class="err-meta"><span>${e.ts}</span><span style="font-family:monospace">${esc(e.module)}</span></div>
-      ${detail}</div>${countBadge}</div></div>`;
+      <span class="impact-pill ${meta.cls}">${meta.icon} ${meta.label}</span>
+      <div style="flex:1">
+        <div class="err-msg">${esc(e.message)}</div>
+        <div class="err-meta"><span>${e.ts}</span><span style="font-family:monospace">${esc(e.module)}</span></div>
+        ${reason}${detail}
+      </div>
+      ${countBadge}
+    </div></div>`;
   }).join('');
 }
 
@@ -478,10 +653,13 @@ function toggleRow(id){document.getElementById(id).classList.toggle('expanded')}
 
 function renderErrors(data){
   allErrors=data.events;
+  const bi=data.by_impact||{};
   let pills='';
-  if(data.criticals>0) pills+=`<span class="err-sum-pill pill-crit">⚠ ${data.criticals} critical</span>`;
-  if(data.errors>0)    pills+=`<span class="err-sum-pill pill-error">✕ ${data.errors} errors</span>`;
-  if(data.warnings>0)  pills+=`<span class="err-sum-pill pill-warn">△ ${data.warnings} warnings</span>`;
+  if(data.criticals>0)    pills+=`<span class="err-sum-pill pill-crit">⚠ ${data.criticals} critical</span>`;
+  if(bi.blocked>0)        pills+=`<span class="err-sum-pill pill-blocked">⛔ ${bi.blocked} blocked trading</span>`;
+  if(bi.delayed>0)        pills+=`<span class="err-sum-pill pill-delayed">⚠ ${bi.delayed} signal delayed</span>`;
+  if(data.errors>0)       pills+=`<span class="err-sum-pill pill-error">✕ ${data.errors} errors</span>`;
+  if(data.warnings>0)     pills+=`<span class="err-sum-pill pill-warn">△ ${data.warnings} warnings</span>`;
   document.getElementById('err-pills').innerHTML=pills||'<span style="color:var(--muted);font-size:12px">No issues found</span>';
   renderErrorList();
 }
