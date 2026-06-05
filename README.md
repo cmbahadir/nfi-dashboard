@@ -64,10 +64,19 @@ systemctl --user restart freqtrade-dashboard
 journalctl --user -u freqtrade-dashboard -f
 ```
 
+## LAN / Tailscale access via nginx (recommended)
+
+If port 8888 is blocked by a firewall or router, put nginx in front on port 8080:
+
+```bash
+sudo cp nginx-dashboard.conf /etc/nginx/conf.d/dashboard.conf
+sudo systemctl reload nginx
+```
+
 ## Access
 
-| Network   | URL                          |
-|-----------|------------------------------|
-| Local     | `http://localhost:8888`      |
-| LAN       | `http://<your-lan-ip>:8888`  |
-| Tailscale | `http://<tailscale-ip>:8888` |
+| Network   | Direct (port 8888)             | Via nginx (port 8080)          |
+|-----------|--------------------------------|--------------------------------|
+| Local     | `http://localhost:8888`        | `http://localhost:8080`        |
+| LAN       | `http://<your-lan-ip>:8888`    | `http://<your-lan-ip>:8080`    |
+| Tailscale | `http://<tailscale-ip>:8888`   | `http://<tailscale-ip>:8080`   |
