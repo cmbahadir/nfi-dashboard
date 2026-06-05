@@ -1,0 +1,19 @@
+[Unit]
+Description=FreqTrade Performance Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/nfi-dashboard
+ExecStart=/usr/bin/python3 /path/to/nfi-dashboard/dashboard.py
+Environment=FREQTRADE_DB=/path/to/freqtrade/tradesv3.sqlite
+Environment=FREQTRADE_LOG=/path/to/freqtrade/user_data/logs/freqtrade_nfi.log
+Environment=DASHBOARD_PORT=8888
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
